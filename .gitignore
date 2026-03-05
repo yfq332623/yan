@@ -1,0 +1,21 @@
+ # 忽略常见二进制/目标文件
+ *.o
+ *.obj
+ *.a
+ *.so
+ *.dll
+ *.exe
+ *.out
+ *.lib
+
+ # 常见构建目录
+ /build/
+ /bin/
+ /dist/
+ /CMakeFiles/
+
+ # 日志文件
+ *.log
+
+# 文本文件（仅忽略 count.txt）
+count.txt
