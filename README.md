@@ -22,12 +22,13 @@ make
     也可加访问127.0.0.1:8888/fudan 可以添加/...
 
 📂 核心代码导读
-main.cpp: 事件监听与分发中心。
+
+webServer.h:事件监听与分发中心。
 
 connection_pool.h: 数据库车队调度逻辑。
 
 log.h: 异步日志生产/消费者模型。
 
-util_timer.h: 升序链表实现的15s定时器
+util_timer.h: 升序链表实现的15s定时器。
 
 www/: 存放静态资源（如 index.html）。
