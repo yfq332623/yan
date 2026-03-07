@@ -205,6 +205,7 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
         return;
     }
 
+    string raw_request = data;  // 保存完整报文，用于终端打印
 
     int state = 0; //定义状态
     string path = "index.html";
@@ -224,6 +225,7 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
                 }
                 Log::get_instance()->write_log(0, "Extract Path: %s", path.c_str());
                 Log::get_instance()->write_log(0, "Normal request fd: %d", client_socket);
+                cout << "---------- HTTP Request ----------\n" << raw_request << "---------- End ----------\n";
                 if (path == "/" || path == "") {
                     path = "index.html";
                 }
@@ -245,7 +247,6 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
 
     string status = "200 OK";
     string content;
-    cout << "Debug: 正在尝试打开文件 -> " << filename << endl;
     ifstream f(filename);
     if (!f.is_open()) {
         status = "404 Not Found";
@@ -275,7 +276,6 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
     if (send(client_socket, response.c_str(), response.size(), 0) > 0) {
         server->visit_mtx.lock();
         server->visit_count++;
-        cout << "访客+1，总数: " << server->visit_count << endl;
         ofstream out("count.txt");
         out << server->visit_count;
         server->visit_mtx.unlock();
