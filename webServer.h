@@ -48,16 +48,16 @@ private:
     int _server_fd;
     int visit_count = 0;
     int _epoll_fd = -1;
-    mutex visit_mtx;
-    mutex queue_mtx;
-    mutex map_mtx;
-    vector<thread> _workers;
-    queue<unique_ptr<ThreadArgs>> _tasks;
+    mutex visit_mtx; //计数器互斥锁
+    mutex queue_mtx; //任务队列互斥锁
+    mutex map_mtx; //任务队列互斥锁
+    vector<thread> _workers; //线程池
+    queue<unique_ptr<ThreadArgs>> _tasks;  //任务队列
     condition_variable _cv;
     bool stop = false;
     unordered_map<int, string> client_buffers;
-    sort_timer_lst timer_lst;
-    unordered_map<int, util_timer*> fd_to_timer;
+    sort_timer_lst timer_lst; //处理定时超时的升序链表
+    unordered_map<int, util_timer*> fd_to_timer;//索引判断fd这个链接闹钟在不在
     static int pipefd[2];
 
     // 删除货架的函数,删map,删监控,关闭连接

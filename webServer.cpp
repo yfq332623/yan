@@ -77,7 +77,7 @@ bool WebServer::init() {
     }
     struct epoll_event ev;
     ev.data.fd = _server_fd;
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN;  //
     if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, _server_fd, &ev) == -1) return false;
 
     ifstream is("count.txt");
@@ -96,17 +96,17 @@ void WebServer::start() {
         int n = epoll_wait(_epoll_fd, events, 1024, 5000); //存放请求个数,参数"-1"表示永久阻塞,就是一直会等着,来数据了就响应
                                                            //改成5000ms就会醒来一次
 
-        timer_lst.tick();//先检测定时器有没有超时
+        timer_lst.tick();//先检测定时器链表里面有没有超时的闹钟
 
         for (int i = 0; i < n; ++i) {
             int active_fd = events[i].data.fd;//定义一个active来收取监控里的编号
             if (active_fd == _server_fd) {      //如果收取到的编号是新的
                 int new_socket = accept(_server_fd, NULL, NULL);
                 if (new_socket >= 0) {
-                    SetNonBlocking(new_socket);
+                    SetNonBlocking(new_socket); // 变成非阻塞函数
 
-                    util_timer* timer = new util_timer();
-                    timer->user_data = new client_data();
+                    util_timer* timer = new util_timer();  // 创建一个定时器闹钟
+                    timer->user_data = new client_data();  //闹钟和客户数据同时存在
                     timer->user_data->socket_fd = new_socket;
                     timer->expire = time(NULL) + 15; // 15秒不说话就踢掉
                     timer->cb_fun = cb_func;
@@ -122,7 +122,6 @@ void WebServer::start() {
                 client_ev.data.fd = new_socket;
                 client_ev.events = EPOLLIN | EPOLLET;//ET模式下需要的方式也就是非阻塞边缘触发
                 epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, new_socket, &client_ev);
-                cout << "新客进店(ET模式): " << new_socket << endl;
             }
 
             else {                           //如果收取到的编号是老的
@@ -130,7 +129,6 @@ void WebServer::start() {
                     util_timer* timer = fd_to_timer[active_fd];
                     timer->expire = time(NULL) + 15; // 重新给 15 秒
                     timer_lst.adjust_timer(timer);
-                    Log::get_instance()->write_log(0, "Timer adjusted for fd %d", active_fd);
                 }
 
                 epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, active_fd, NULL);
@@ -153,6 +151,11 @@ void WebServer::cb_func(client_data* user_data) {
 
 void WebServer::close_connection(int fd) {
     lock_guard<mutex> lock(map_mtx);
+    if (fd_to_timer.count(fd)) {
+        util_timer* timer = fd_to_timer[fd];
+        timer_lst.del_timer(timer);
+        fd_to_timer.erase(fd);
+    }
     client_buffers.erase(fd);
     epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
@@ -215,7 +218,12 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
             size_t p2 = line.find(" ", p1 + 1);
             if (p1 != string::npos && p2 != string::npos) {
                 path = line.substr(p1 + 1, p2 - p1 - 1);
+                if (path.find("favicon.ico") != string::npos) {
+                    server->close_connection(client_socket);
+                    return;
+                }
                 Log::get_instance()->write_log(0, "Extract Path: %s", path.c_str());
+                Log::get_instance()->write_log(0, "Normal request fd: %d", client_socket);
                 if (path == "/" || path == "") {
                     path = "index.html";
                 }
@@ -228,11 +236,6 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
     {
         lock_guard<mutex> lock(server->map_mtx);
         server->client_buffers.erase(client_socket);
-    }
-
-    if (path.find("favicon.ico") != string::npos) {
-        server->close_connection(client_socket);
-        return;
     }
 
     if (path != "index.html") {

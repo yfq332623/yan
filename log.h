@@ -19,7 +19,7 @@ template <typename T>
 
 class block_queue{
 public:
-   block_queue(int max_size =1000):m_max_size(max_size){};
+   block_queue(size_t max_size = 1000) : m_max_size(max_size) {}
 
    bool full() {
         m_mutex.lock();
@@ -52,7 +52,7 @@ public:
     return true;
    }
 private:
-   int m_max_size;
+   size_t m_max_size;
    mutex m_mutex;
    condition_variable m_cond;
    deque<T> m_queue;
