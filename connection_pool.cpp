@@ -36,9 +36,9 @@ void connection_pool::init(string url, string User, string Password, string DBNa
 }
 
 MYSQL *connection_pool::GetConnection() {
-    MYSQL *con = NULL;
+    MYSQL *con = nullptr;
 
-    if (0 == connList.size()) return NULL;
+    if (0 == connList.size()) return nullptr;
 
     // A. 关键：等待信号量（如果没有卡了，线程会在这里排队）
     sem_wait(&reserve);

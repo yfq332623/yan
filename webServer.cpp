@@ -1,5 +1,27 @@
 #include "webServer.h"
 
+// 统一的文件读取工具：
+// 1) 优先尝试读取目标文件 path
+// 2) 若失败，则尝试读取 ./www/404.html
+// 3) 若仍失败，则返回内置的 404 HTML
+static std::string read_file_or_404(const std::string& path) {
+    ifstream file(path);
+    if (file.is_open()) {
+        stringstream ss;
+        ss << file.rdbuf();
+        return ss.str();
+    }
+
+    ifstream f404("./www/404.html");
+    if (f404.is_open()) {
+        stringstream ss;
+        ss << f404.rdbuf();
+        return ss.str();
+    }
+
+    return "<html><body><h1>404 Page Missing</h1></body></html>";
+}
+
 int WebServer::pipefd[2];
 
 void WebServer::SetNonBlocking(int fd) {
@@ -150,7 +172,7 @@ void WebServer::cb_func(client_data* user_data) {
 }
 
 void WebServer::close_connection(int fd) {
-    lock_guard<mutex> lock(map_mtx);
+    lock_guard<mutex> lock(conn_mtx);
     if (fd_to_timer.count(fd)) {
         util_timer* timer = fd_to_timer[fd];
         timer_lst.del_timer(timer);
@@ -199,79 +221,109 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
             }
         }
     }
-    //如果啥也没有发送
-    if (data.empty()) {
-        server->close_connection(client_socket);
+
+    // 阶段0：仅当收到完整 HTTP 头部（\r\n\r\n）才开始解析，否则等待下次继续读取
+    if (data.find("\r\n\r\n") == string::npos) {
         return;
     }
-
-    string raw_request = data;  // 保存完整报文，用于终端打印
-
-    int state = 0; //定义状态
-    string path = "index.html";
-    while (true) {
-        size_t pos = data.find("\r\n");   //先判定数据是否存在第一行
-        if (pos == string::npos) return;    //不存在直接return
-        string line = data.substr(0, pos); //取第一行
-        data.erase(0, pos + 2);              //取完之后消除第一行更新第一行内容
-        if (state == 0) {
-            size_t p1 = line.find(" ");
-            size_t p2 = line.find(" ", p1 + 1);
-            if (p1 != string::npos && p2 != string::npos) {
-                path = line.substr(p1 + 1, p2 - p1 - 1);
-                if (path.find("favicon.ico") != string::npos) {
-                    server->close_connection(client_socket);
-                    return;
-                }
-                Log::get_instance()->write_log(0, "Extract Path: %s", path.c_str());
-                Log::get_instance()->write_log(0, "Normal request fd: %d", client_socket);
-                cout << "---------- HTTP Request ----------\n" << raw_request << "---------- End ----------\n";
-                if (path == "/" || path == "") {
-                    path = "index.html";
-                }
-                state = 1;
-            }
-        } else if (state == 1) {
-            if (line.empty()) break;
-        }
-    }
-    {
-        lock_guard<mutex> lock(server->map_mtx);
-        server->client_buffers.erase(client_socket);
-    }
-
-    if (path != "index.html") {
-        path += ".html";
-    }
-    string filename = "./www/" + path;
+    HttpRequest req;
+    if (!Parse(data, req, client_socket, server))
+        return;
 
     string status = "200 OK";
     string content;
-    ifstream f(filename);
-    if (!f.is_open()) {
-        status = "404 Not Found";
-        f.clear();
-        f.open("./www/404.html");
-    }
 
-    if (f.is_open()) {
-        stringstream ss;
-        ss << f.rdbuf();
-        content = ss.str();
-        if (path == "index.html") {
-            string targe = "{{COUNT}}";
-            size_t pos = content.find(targe);
-            if (pos != string::npos) {
-                content.replace(pos, targe.length(), to_string(server->visit_count + 1));
+    if (req.method == "POST") {
+        // 假定 body 为表单格式：username=xxx&password=yyy
+        string username, password;
+
+        // 先按 '&' 拆分为若干对 key=value
+        size_t start = 0;
+        while (start < req.body.size()) {
+            size_t amp = req.body.find('&', start);
+            string pair;
+            if (amp == string::npos) {
+                pair = req.body.substr(start);
+                start = req.body.size();
+            } else {
+                pair = req.body.substr(start, amp - start);
+                start = amp + 1;
+            }
+
+            if (pair.empty()) continue;
+
+            size_t eq = pair.find('=');
+            if (eq == string::npos) continue;
+
+            string key = pair.substr(0, eq);
+            string value = pair.substr(eq + 1);
+
+            if (key == "username") {
+                username = value;
+            } else if (key == "password") {
+                password = value;
             }
         }
+
+        MYSQL *conn = nullptr;
+        connectionRAII mysql_conn(&conn, connection_pool::GetInstance());
+
+        bool login_ok = false;
+
+        if (!username.empty() && !password.empty() && conn != nullptr) {
+            // 根据用户名从数据库查询密码
+            char sql[512];
+            snprintf(sql, sizeof(sql),
+                     "SELECT password FROM user WHERE username='%s'",
+                     username.c_str());
+
+            if (mysql_query(conn, sql) == 0) {
+                MYSQL_RES *res = mysql_store_result(conn); //将查询结果存储在结果集中
+                if (res != nullptr) {
+                    MYSQL_ROW row = mysql_fetch_row(res); //从结果集中获取一行数据
+                    if (row && row[0]) {
+                        string db_pass = row[0];
+                        if (db_pass == password) {
+                            login_ok = true;
+                        }
+                    }
+                    mysql_free_result(res);
+                }
+            }
+        }
+
+        if (login_ok) {
+            content = read_file_or_404("./www/login_success.html");
+        } else {
+            status = "401 Unauthorized";
+            content = read_file_or_404("./www/login_failed.html");
+        }
     } else {
-        content = "<html><body><h1>404 Page Missing</h1></body></html>";
+        // 默认为 GET 等静态文件请求，从 www 目录读取文件
+        string filename = "./www/" + req.path;
+        ifstream f(filename);
+        if (!f.is_open()) {
+            status = "404 Not Found";
+            content = read_file_or_404("./www/404.html");
+        } else {
+            stringstream ss;
+            ss << f.rdbuf();
+            content = ss.str();
+            if (req.path == "index.html") {
+                string targe = "{{COUNT}}";
+                size_t pos = content.find(targe);
+                if (pos != string::npos) {
+                    content.replace(pos, targe.length(), to_string(server->visit_count + 1));
+                }
+            }
+        }
     }
 
     string header = "HTTP/1.1 " + status + "\r\nContent-Type: text/html; Charset=UTF-8\r\n";
     header += "Content-Length: " + to_string(content.size()) + "\r\n\r\n";
     string response = header + content;
+
+    cout << "---------- HTTP Response ----------\n" << header << "---------- End ----------\n";
 
     if (send(client_socket, response.c_str(), response.size(), 0) > 0) {
         server->visit_mtx.lock();
@@ -280,7 +332,7 @@ void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
         out << server->visit_count;
         server->visit_mtx.unlock();
 
-        Log::get_instance()->write_log(0, "Path: %s | Total Visits: %d", path.c_str(), server->visit_count);
+        Log::get_instance()->write_log(0, "Path: %s | Total Visits: %d", req.path.c_str(), server->visit_count);
     }
 
     server->close_connection(client_socket);

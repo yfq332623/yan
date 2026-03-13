@@ -4,7 +4,7 @@
 #include <mysql/mysql.h>
 #include <list>
 #include <string>
-#include <semaphore.h>
+#include <semaphore.h> //信号量，用来控制多个线程对共享资源的访问
 #include <mutex>
 using namespace std;
 
