@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/server.dir/src/main.cpp.o CMakeFiles/server.dir/src/webServer.cpp.o CMakeFiles/server.dir/src/connection_pool.cpp.o CMakeFiles/server.dir/src/log.cpp.o CMakeFiles/server.dir/src/util_timer.cpp.o CMakeFiles/server.dir/src/http.cpp.o -o server  -lpthread -lmysqlclient 
