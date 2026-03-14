@@ -1,0 +1,3 @@
+/home/yanfanqi/yan/myweb/build/CMakeFiles/server.dir
+/home/yanfanqi/yan/myweb/build/CMakeFiles/edit_cache.dir
+/home/yanfanqi/yan/myweb/build/CMakeFiles/rebuild_cache.dir
