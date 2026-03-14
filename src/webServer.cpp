@@ -1,0 +1,339 @@
+#include "webServer.h"
+
+// 统一的文件读取工具：
+// 1) 优先尝试读取目标文件 path
+// 2) 若失败，则尝试读取 ./www/404.html
+// 3) 若仍失败，则返回内置的 404 HTML
+static std::string read_file_or_404(const std::string& path) {
+    ifstream file(path);
+    if (file.is_open()) {
+        stringstream ss;
+        ss << file.rdbuf();
+        return ss.str();
+    }
+
+    ifstream f404("./www/404.html");
+    if (f404.is_open()) {
+        stringstream ss;
+        ss << f404.rdbuf();
+        return ss.str();
+    }
+
+    return "<html><body><h1>404 Page Missing</h1></body></html>";
+}
+
+int WebServer::pipefd[2];
+
+void WebServer::SetNonBlocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0); // 1. 获取文件描述符当前的状态标志
+    if (flags == -1) perror("fcntl F_GETFL");
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) perror("fcntl F_SETFL");
+}
+
+WebServer::WebServer(int port, int thread_num)
+    : _port(port), _server_fd(-1) {
+    for (int i = 0; i < thread_num; ++i) {
+        _workers.emplace_back([this] {               // 创建一个线程,形成线程池模式
+            while (true) {
+                unique_ptr<ThreadArgs> arg = nullptr;
+                {
+                    unique_lock<mutex> lock(this->queue_mtx);
+                    this->_cv.wait(lock, [this] {
+                        return this->stop || !this->_tasks.empty();//若没有stop和任务为空则一直休眠线程卡在这里
+                    });
+                    if (this->_tasks.empty() && this->stop) return;//当stop后被叫醒,若任务为空则返回结束线程
+                    arg = move(this->_tasks.front());
+                    this->_tasks.pop();
+                }
+                if (arg) {
+                    handle_client(move(arg));
+                }
+            }
+        });
+    }
+}
+
+WebServer::~WebServer() {
+    {
+        lock_guard<mutex> lock(queue_mtx);
+        stop = true;
+    }
+    _cv.notify_all();
+    for (auto& t : _workers) {
+        if (t.joinable())
+            t.join();
+    }
+}
+
+bool WebServer::init() {
+    // 创建异步日志系统
+    if (!Log::get_instance()->init("server.log", 2000, 800000, 800)) {
+        return false;
+    }
+    _server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (_server_fd < 0) {
+        return false;
+    }
+    int opt = 1;
+
+    // 允许服务器立刻重启时,不用等操作系统回收端口
+    if (setsockopt(_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt error");
+        return false;
+    }
+
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(_port);
+
+    if (bind(_server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) { return false; }
+    if (listen(_server_fd, 5) < 0) {
+        return false;
+    }
+
+    // I/O复用epoll定义
+    _epoll_fd = epoll_create(1);
+    if (_epoll_fd == -1) {
+        return false;
+    }
+    struct epoll_event ev;
+    ev.data.fd = _server_fd;
+    ev.events = EPOLLIN;  //
+    if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, _server_fd, &ev) == -1) return false;
+
+    ifstream is("count.txt");
+    if (is.is_open()) {
+        is >> visit_count;
+        is.close();
+    }
+    Log::get_instance()->write_log(0, "Epoll Server Init Success. Port: %d", _port);
+    cout << "Epoll 服务器初始化成功，监听端口：127.0.0.1:" << _port << endl;
+    return true;
+}
+
+void WebServer::start() {
+    struct epoll_event events[1024];
+    while (true) {                   // 开始epoll监控循环
+        int n = epoll_wait(_epoll_fd, events, 1024, 5000); //存放请求个数,参数"-1"表示永久阻塞,就是一直会等着,来数据了就响应
+                                                           //改成5000ms就会醒来一次
+
+        timer_lst.tick();//先检测定时器链表里面有没有超时的闹钟
+
+        for (int i = 0; i < n; ++i) {
+            int active_fd = events[i].data.fd;//定义一个active来收取监控里的编号
+            if (active_fd == _server_fd) {      //如果收取到的编号是新的
+                int new_socket = accept(_server_fd, NULL, NULL);
+                if (new_socket >= 0) {
+                    SetNonBlocking(new_socket); // 变成非阻塞函数
+
+                    util_timer* timer = new util_timer();  // 创建一个定时器闹钟
+                    timer->user_data = new client_data();  //闹钟和客户数据同时存在
+                    timer->user_data->socket_fd = new_socket;
+                    timer->expire = time(NULL) + 15; // 15秒不说话就踢掉
+                    timer->cb_fun = cb_func;
+
+                    timer_lst.add_timer(timer); // 进名单
+                    fd_to_timer[new_socket] = timer; // 进索引
+
+                } else {
+                    continue;
+                }
+
+                struct epoll_event client_ev;   //建立新的监控来记录new_socket
+                client_ev.data.fd = new_socket;
+                client_ev.events = EPOLLIN | EPOLLET;//ET模式下需要的方式也就是非阻塞边缘触发
+                epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, new_socket, &client_ev);
+            }
+
+            else {                           //如果收取到的编号是老的
+                if (fd_to_timer.count(active_fd)) {
+                    util_timer* timer = fd_to_timer[active_fd];
+                    timer->expire = time(NULL) + 15; // 重新给 15 秒
+                    timer_lst.adjust_timer(timer);
+                }
+
+                epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, active_fd, NULL);
+                auto arg = make_unique<ThreadArgs>(active_fd, this);
+                {
+                    lock_guard<mutex> lock(queue_mtx);
+                    _tasks.push(move(arg));
+                }
+                _cv.notify_one();
+            }
+        }
+    }
+}
+
+void WebServer::cb_func(client_data* user_data) {
+    Log::get_instance()->write_log(1, "Timer expired: close fd %d", user_data->socket_fd);
+    epoll_ctl(user_data->timer->prev ? -1 : -1, EPOLL_CTL_DEL, user_data->socket_fd, 0);
+    close(user_data->socket_fd);
+}
+
+void WebServer::close_connection(int fd) {
+    lock_guard<mutex> lock(conn_mtx);
+    if (fd_to_timer.count(fd)) {
+        util_timer* timer = fd_to_timer[fd];
+        timer_lst.del_timer(timer);
+        fd_to_timer.erase(fd);
+    }
+    client_buffers.erase(fd);
+    epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+    close(fd);
+}
+
+void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
+    int client_socket = arg->socket;
+    WebServer* server = arg->self;
+    char buffer[1024] = {0};
+    string& data = server->client_buffers[client_socket];
+    //string request_data;
+    while (true) {
+
+        //非阻塞I/O下的读取逻辑
+
+        int bytes_read = read(client_socket, buffer, sizeof(buffer) - 1);
+        if (bytes_read > 0) {
+
+            //只要能读取到数据就 > 0,然后接在request_data后面
+
+            buffer[bytes_read] = '\0';       //一种增强性能的方式,再要拷贝的字符数组最后加'\0'
+            data.append(buffer);
+        }
+
+        if (bytes_read == 0) {
+            server->close_connection(client_socket);
+            return;
+        }
+
+        if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+
+                //内核缓冲区空了,数据被读完了
+                break;
+            if (errno == EINTR)
+                //被系统打断，再试一次
+                continue;
+            else {
+                server->close_connection(client_socket);
+                return;
+            }
+        }
+    }
+
+    // 阶段0：仅当收到完整 HTTP 头部（\r\n\r\n）才开始解析，否则等待下次继续读取
+    if (data.find("\r\n\r\n") == string::npos) {
+        return;
+    }
+    HttpRequest req;
+    if (!Parse(data, req, client_socket, server))
+        return;
+
+    string status = "200 OK";
+    string content;
+
+    if (req.method == "POST") {
+        // 假定 body 为表单格式：username=xxx&password=yyy
+        string username, password;
+
+        // 先按 '&' 拆分为若干对 key=value
+        size_t start = 0;
+        while (start < req.body.size()) {
+            size_t amp = req.body.find('&', start);
+            string pair;
+            if (amp == string::npos) {
+                pair = req.body.substr(start);
+                start = req.body.size();
+            } else {
+                pair = req.body.substr(start, amp - start);
+                start = amp + 1;
+            }
+
+            if (pair.empty()) continue;
+
+            size_t eq = pair.find('=');
+            if (eq == string::npos) continue;
+
+            string key = pair.substr(0, eq);
+            string value = pair.substr(eq + 1);
+
+            if (key == "username") {
+                username = value;
+            } else if (key == "password") {
+                password = value;
+            }
+        }
+
+        MYSQL *conn = nullptr;
+        connectionRAII mysql_conn(&conn, connection_pool::GetInstance());
+
+        bool login_ok = false;
+
+        if (!username.empty() && !password.empty() && conn != nullptr) {
+            // 根据用户名从数据库查询密码
+            char sql[512];
+            snprintf(sql, sizeof(sql),
+                     "SELECT password FROM user WHERE username='%s'",
+                     username.c_str());
+
+            if (mysql_query(conn, sql) == 0) {
+                MYSQL_RES *res = mysql_store_result(conn); //将查询结果存储在结果集中
+                if (res != nullptr) {
+                    MYSQL_ROW row = mysql_fetch_row(res); //从结果集中获取一行数据
+                    if (row && row[0]) {
+                        string db_pass = row[0];
+                        if (db_pass == password) {
+                            login_ok = true;
+                        }
+                    }
+                    mysql_free_result(res);
+                }
+            }
+        }
+
+        if (login_ok) {
+            content = read_file_or_404("./www/login_success.html");
+        } else {
+            status = "401 Unauthorized";
+            content = read_file_or_404("./www/login_failed.html");
+        }
+    } else {
+        // 默认为 GET 等静态文件请求，从 www 目录读取文件
+        string filename = "./www/" + req.path;
+        ifstream f(filename);
+        if (!f.is_open()) {
+            status = "404 Not Found";
+            content = read_file_or_404("./www/404.html");
+        } else {
+            stringstream ss;
+            ss << f.rdbuf();
+            content = ss.str();
+            if (req.path == "index.html") {
+                string targe = "{{COUNT}}";
+                size_t pos = content.find(targe);
+                if (pos != string::npos) {
+                    content.replace(pos, targe.length(), to_string(server->visit_count + 1));
+                }
+            }
+        }
+    }
+
+    string header = "HTTP/1.1 " + status + "\r\nContent-Type: text/html; Charset=UTF-8\r\n";
+    header += "Content-Length: " + to_string(content.size()) + "\r\n\r\n";
+    string response = header + content;
+
+    cout << "---------- HTTP Response ----------\n" << header << "---------- End ----------\n";
+
+    if (send(client_socket, response.c_str(), response.size(), 0) > 0) {
+        server->visit_mtx.lock();
+        server->visit_count++;
+        ofstream out("count.txt");
+        out << server->visit_count;
+        server->visit_mtx.unlock();
+
+        Log::get_instance()->write_log(0, "Path: %s | Total Visits: %d", req.path.c_str(), server->visit_count);
+    }
+
+    server->close_connection(client_socket);
+}
