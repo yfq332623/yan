@@ -22,7 +22,6 @@ static std::string read_file_or_404(const std::string& path) {
     return "<html><body><h1>404 Page Missing</h1></body></html>";
 }
 
-int WebServer::pipefd[2];
 
 void WebServer::SetNonBlocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0); // 1. 获取文件描述符当前的状态标志
@@ -108,7 +107,7 @@ bool WebServer::init() {
         is.close();
     }
     Log::get_instance()->write_log(0, "Epoll Server Init Success. Port: %d", _port);
-    cout << "Epoll 服务器初始化成功，监听端口：127.0.0.1:" << _port << endl;
+    cout << "Epoll 服务器初始化成功,监听端口:127.0.0.1:" << _port << endl;
     return true;
 }
 
@@ -127,9 +126,9 @@ void WebServer::start() {
                 if (new_socket >= 0) {
                     SetNonBlocking(new_socket); // 变成非阻塞函数
 
-                    util_timer* timer = new util_timer();  // 创建一个定时器闹钟
-                    timer->user_data = new client_data();  //闹钟和客户数据同时存在
+                    util_timer* timer = new util_timer();  // 构造函数内已 new client_data 并设 user_data->timer
                     timer->user_data->socket_fd = new_socket;
+                    timer->user_data->server = this;
                     timer->expire = time(NULL) + 15; // 15秒不说话就踢掉
                     timer->cb_fun = cb_func;
 
@@ -165,23 +164,26 @@ void WebServer::start() {
     }
 }
 
-void WebServer::cb_func(client_data* user_data) {
-    Log::get_instance()->write_log(1, "Timer expired: close fd %d", user_data->socket_fd);
-    epoll_ctl(user_data->timer->prev ? -1 : -1, EPOLL_CTL_DEL, user_data->socket_fd, 0);
-    close(user_data->socket_fd);
-}
-
-void WebServer::close_connection(int fd) {
+void WebServer::close_connection(int fd, bool from_timer) {
     lock_guard<mutex> lock(conn_mtx);
     if (fd_to_timer.count(fd)) {
         util_timer* timer = fd_to_timer[fd];
-        timer_lst.del_timer(timer);
+        // 若由定时器回调调用：tick() 会在回调返回后摘链并 delete 该节点，此处只从 fd_to_timer 抹掉，避免重复 delete。
+        if (!from_timer) {
+            timer_lst.del_timer(timer);
+        }
         fd_to_timer.erase(fd);
     }
     client_buffers.erase(fd);
     epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
 }
+
+void WebServer::cb_func(client_data* user_data) {
+    Log::get_instance()->write_log(1, "Timer expired: close fd %d", user_data->socket_fd);
+    user_data->server->close_connection(user_data->socket_fd, true);
+}
+
 
 void WebServer::handle_client(unique_ptr<ThreadArgs> arg) {
     int client_socket = arg->socket;

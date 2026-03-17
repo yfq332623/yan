@@ -8,14 +8,16 @@
  *.out
  *.lib
 
- # 常见构建目录
- /build/
+# 常见构建目录（忽略任意位置的 build 目录）
+build/
  /bin/
  /dist/
  /CMakeFiles/
 
- # 日志文件
- *.log
+# 日志文件
+*.log
+server.log
+*_server.log
 
 # 文本文件（仅忽略 count.txt）
 count.txt

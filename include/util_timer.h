@@ -7,11 +7,13 @@
 
 using namespace std;
 class util_timer;
+class WebServer;
 
 struct client_data{
     sockaddr_in address;
     int socket_fd;
     util_timer* timer;
+    WebServer* server;
 };
 
 class util_timer{
@@ -21,7 +23,12 @@ public:
    client_data* user_data;
    util_timer* next;
     util_timer*  prev;
-   util_timer():next(nullptr),prev(nullptr){}
+   util_timer() :  user_data(new client_data()) ,next(nullptr), prev(nullptr){
+       user_data->timer = this;
+   }
+   ~util_timer() {
+       delete user_data;
+   }
 };
 
 class sort_timer_lst{
